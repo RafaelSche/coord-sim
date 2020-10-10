@@ -93,7 +93,9 @@ class PlacementAnime:
         cm = plt.cm.get_cmap("tab10", len(self.components))
         self.component_colors = {component: cm(i) for i, component in enumerate(self.components)}
         # component placement marks offset on x axis in relation to the node position
-        self.component_offsets = {"a": -1, "b": 0, "c": 1}
+        _from = -int(len(self.components)/2)
+        to = _from + len(self.components)
+        self.component_offsets = {component: i for component, i in zip(self.components, range(_from, to))}
         self.component_offsets_y = 1  # same for the y axis
         cm = plt.cm.get_cmap("gist_rainbow", self.net_x.number_of_nodes())
         # curve color in the ingress traffic plot
