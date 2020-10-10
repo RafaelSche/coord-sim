@@ -8,7 +8,8 @@ import networkx
 import pandas as pd
 import os
 import yaml
-
+import matplotlib
+matplotlib.use('TkAgg')
 
 # https://stackoverflow.com/questions/40233986/python-is-there-a-function-or-formula-to-find-the-complementary-colour-of-a-rgb
 # Sum of the min & max of (a, b, c)
@@ -65,6 +66,7 @@ class PlacementAnime:
         self.set_linkDelay()  # compute LinkDelay from nodes positions and write it to the networkx object
         self.get_ingress_and_resources_files()
         self.placement = pd.read_csv(self.placement_file)
+        self.components = list(set(self.placement["sf"]))
         self.placement = self.placement.groupby(["time"])
         self.run_duration = int(np.mean(np.diff(list(self.placement.groups.keys()))))
         if "dropped_flows" in additional_subplots:
@@ -88,7 +90,8 @@ class PlacementAnime:
         self.id_labels = {}
 
         self.run_flows_colors = {"successful_flows": "b", "dropped_flows": "y", "total_flows": "g"}
-        self.component_colors = {"a": "b", "b": "y", "c": "g"}
+        cm = plt.cm.get_cmap("tab10", len(self.components))
+        self.component_colors = {component: cm(i) for i, component in enumerate(self.components)}
         # component placement marks offset on x axis in relation to the node position
         self.component_offsets = {"a": -1, "b": 0, "c": 1}
         self.component_offsets_y = 1  # same for the y axis
