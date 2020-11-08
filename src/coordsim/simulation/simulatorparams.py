@@ -114,7 +114,7 @@ class SimulatorParams:
         params_str += f"deterministic_size: {self.deterministic_size}\n"
         return params_str
 
-    def update_state(self):
+    def update_state_old(self):
         """
         Change or keep the MMP state for each of the network's node
         State change decision made based on the switch probability defined with states definition in config.
@@ -132,6 +132,23 @@ class SimulatorParams:
                 else:
                     current_state = state_names[0]
                 self.current_states[node_id[0]] = current_state
+        self.update_inter_arr_mean()
+
+    def update_state(self):
+        for node_id in self.ing_nodes:
+            current_state = self.current_states[node_id[0]]
+            switch = []
+            probs = []
+            change_probs = self.states[current_state]['switch_p']
+            if isinstance(change_probs, dict):
+                for state, prob in change_probs.items():
+                    switch.append(state)
+                    probs.append(prob)
+            else:
+                state_names = list(self.states.keys())
+                probs = [change_probs]*len(state_names)
+            current_state = np.random.choice(switch, p=probs)
+            self.current_states[node_id[0]] = current_state
         self.update_inter_arr_mean()
 
     def update_inter_arr_mean(self):
