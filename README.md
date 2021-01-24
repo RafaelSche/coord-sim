@@ -219,9 +219,52 @@ coord-sim/params/convert_traces$ python3 convert_traces.py --config_file trace_x
 ```
 For more information look at the doctrings in the script or the comments in the example config.   
 
+
 #### Overall abilene intermediate file
 
 We have an intermediate csv-file [overall_abilene_intermediate.csv](https://github.com/RealVNF/coord-sim/blob/master/params/convert_traces/overall_abilene_intermediate.csv), which contains the whole abilene batch from sndlib with 48 thousand time step. It is recommended to use it for producing traces for the abilenme network by setting the `source` parameter in config to it. 
+
+## Create Episode Animations  
+  
+Another way to analyse results is to create animation, which shows the placement in a single test episode changing over time. Use command `animation` for that:  
+  
+Create animation from the first test directory from a results directory: `animation --results_dir <>`
+To show all available test directories in a results directory: `animation --results_dir <> --show_tests`  
+Create animation from test directory: `animation --test_dir <>`  
+Show animation in the end (by calling plt.show()): `animation --test_dir <> --show`  
+Save animation as html video: `animation --test_dir <> --save <possible values: html, git, both>`  
+You can limit the amount of data to process by setting `--sample_rate`: `animation --test_dir <> --sample_rate 5`  Default is 1
+Thus for example every fifth point in time will be taken into the animation. Resolution will be worse, of course. But it is useful if the scenario is to big
+Set interval between frames: `animation --test_dir <> --interval 100`  Default is 100
+  
+Create an animation not from cli, but as python code with the PlacementAnime class:  
+```py
+pa = PlacementAnime(test_dir)
+pa.create_animation()
+pa.animation # animation object
+pa.fig # figure object
+pa.ax # Axis object (network, placement etc)
+pa.ingress_traffic_ax # Axis object (ingress_traffic)
+```
+
+Maybe you will need the tkinter module installed for that: `sudo apt install python3-tk`
+
+## LSTM Traffic Prediction
+
+The simulator has an LSTM module to predict traffic based on the traffic traces mentioned above. 
+
+The LSTM module must be trained separately, to do so, `lstm_prediction` must be enabled in the simulator config file. Additionally, `lstm_weights` must be set to the directory where the desired location to save the weights within the current working directory. This will also be used during the running of the simulator to load the weights.
+
+To train the LSTM nerual network:
+
+Use the `lstm-predict` module similar to the example below. The module takes one argument — the simulator config file that will be used during the actual simulation.
+```
+lstm-predict -c <PATH-TO-CONFIG-FILE>
+```
+This will train the LSTM network based on the trace specified in the `trace_path` in the config file, then save the weights to the weights directory specified in the config file. 
+
+Afterwards, use the same configuration file when using the simulator to make sure that weights are correctly loaded in the simulator later on.
+
 
 ## Tests
 

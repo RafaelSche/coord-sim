@@ -13,10 +13,15 @@ deterministic_size: True           # default: True
 # can be overridden by deterministic_arrival and deterministic_size
 #deterministic: True                # default: False
 run_duration: 100                  # default: 100
+ttl_choices: [50]
 
 # Optional: Trace file trace relative to the CWD.
 # Until values start in the trace file, the defaults from this file are used
 # trace_path: params/traces/default_trace.csv
+
+# future_traffic: True
+# lstm_prediction: True
+# lstm_weights: params/lstm_weights
 
 # Optional: Write Scheduling results
 write_schedule: True

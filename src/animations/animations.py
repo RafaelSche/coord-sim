@@ -1,96 +1,214 @@
-from matplotlib.animation import FuncAnimation, ArtistAnimation
+from matplotlib.animation import ArtistAnimation
 from geopy.distance import distance as dist
-from matplotlib.widgets import Slider
 from argparse import ArgumentParser
 from pprint import pprint
 import matplotlib.pyplot as plt
 import numpy as np
-import matplotlib
 import networkx
 import pandas as pd
 import os
-matplotlib.use('TkAgg')
+import yaml
+
+
+# https://stackoverflow.com/questions/40233986/python-is-there-a-function-or-formula-to-find-the-complementary-colour-of-a-rgb
+# Sum of the min & max of (a, b, c)
+def hilo(a, b, c):
+    if c < b:
+        b, c = c, b
+    if b < a:
+        a, b = b, a
+    if c < b:
+        b, c = c, b
+    return a + c
+
+
+def complement(r, g, b, y=None):
+    k = hilo(r, g, b)
+    return tuple(k - u for u in (r, g, b)) + (y,)
 
 
 class PlacementAnime:
+    """
+    Class for handling data for the animation.
+    """
+    additional_subplots = ["ingress_traffic", "dropped_flows"]
 
     def __init__(self, test_dir=".", placement_file="placements.csv", rl_state_file="rl_state.csv",
-                 resources_file="resources.csv"):
+                 resources_file="resources.csv", node_metrics_file="node_metrics.csv",
+                 run_flows_file="run_flows.csv", video_filename=None, additional_subplots=additional_subplots,
+                 place_per_axis=2, sample_rate=1, interval=100):
+        # directories for the source files
         self.test_dir = test_dir
         self.network_file = self.get_network_filename()
         self.placement_file = os.path.join(test_dir, placement_file)
         self.rl_state_file = os.path.join(test_dir, rl_state_file)
         self.resources_file = os.path.join(test_dir, resources_file)
-
-        self.net_x = networkx.read_graphml(self.network_file)
-        self.set_linkDelay()
-        self.placement = pd.read_csv(self.placement_file)
-        self.placement = self.placement.groupby(["time"])
-        self.ingress_traffic = pd.read_csv(self.rl_state_file, header=None)
-        self.ingress_traffic.columns = ["episode", "time"]+[f"pop{i}" for i in range(self.net_x.number_of_nodes())]
-        self.node_pos = self.determine_node_pos()
-        self.edge_pos = self.determine_edge_pos()
-        self.extent_offset = 5
-        self.axis_extent = self.determine_extent()
-
-        self.component_colors = {"a": "b", "b": "y", "c": "g"}
-        self.component_offsets = {"a": -1, "b": 0, "c": 1}
-        self.component_offsets_y = 1
-        self.ingress_node_colors = {"pop0": "b", "pop1": "y", "pop2": "g"}
-        self.last_point = {"pop0": [0, 0], "pop1": [0, 0], "pop2": [0, 0]}
-
-        self.fig = plt.figure()
-        #self.ax = plt.subplots(2, 1)
-        self.ax, self.ing_traffic_ax = self.fig.add_subplot(211), self.fig.add_subplot(212)
-        self.ln = plt.plot([], [])
-        self.ln.extend(self.draw_network())
-        self.ln.extend(self.plot_capacity())
-        self.ln.extend(self.plot_delay())
-        #self.time_label = plt.text(self.axis_extent[0, 0] + 1, self.axis_extent[1, 0] + 1, "0")
-        #self.ln.append(self.time_label)
-        self.animation = None
-        self.artists = []
-        self.moments = []
-        self.ln_ingress = []
-
-        if not test_dir == ".":
+        self.node_metrics_file = os.path.join(test_dir, node_metrics_file)
+        self.run_flows_file = os.path.join(test_dir, run_flows_file)
+        if video_filename:
+            self.video_filename = video_filename
+        elif not test_dir == ".":
             self.video_filename = os.path.basename(os.path.dirname(test_dir))
         else:
             self.video_filename = "animation_video"
+
+        self.sample_rate = sample_rate
+        self.interval = interval
+
+        self.node_metrics = None
+        self._resources = None
+        self.rl_state = None
+        self.additional_subplots = additional_subplots
+        self.place_per_axis = place_per_axis
+
+        self.net_x = networkx.read_graphml(self.network_file)
+        self.set_linkDelay()  # compute LinkDelay from nodes positions and write it to the networkx object
+        self.get_ingress_and_resources_files()
+        self.placement = pd.read_csv(self.placement_file)
+        self.placement = self.placement.groupby(["time"])
+        self.run_duration = int(np.mean(np.diff(list(self.placement.groups.keys()))))
+        if "dropped_flows" in additional_subplots:
+            if os.path.split(self.run_flows_file)[1] in os.listdir(self.test_dir):
+                self.run_flows = pd.read_csv(self.run_flows_file)
+                self.set_total_flows()
+                self.dropped_flows_last_point = {"successful_flows": [0, 0],
+                                                 "dropped_flows": [0, 0],
+                                                 "total_flows": [0, 0]}
+            else:
+                self.additional_subplots.remove("dropped_flows")
+
+        # positions in the format for networkx plot function
+        # position dictionaries related to networkx objects have keys "0", "1", "2" etc. not "pop0", "pop1", "pop2" etc.
+        self.node_pos = self.determine_node_pos()
+        self.edge_pos = self.determine_edge_pos()
+        self.extent_offset = 5
+        self.axis_extent = self.determine_extent()  # axis limits of the plot
+        self.node_colors = [(0, 0, 1) for i in self.net_x.nodes]
+        self.node_load_cmap = plt.cm.get_cmap("RdYlGn_r", 10)
+        self.id_labels = {}
+
+        self.run_flows_colors = {"successful_flows": "b", "dropped_flows": "y", "total_flows": "g"}
+        self.component_colors = {"a": "b", "b": "y", "c": "g"}
+        # component placement marks offset on x axis in relation to the node position
+        self.component_offsets = {"a": -1, "b": 0, "c": 1}
+        self.component_offsets_y = 1  # same for the y axis
+        cm = plt.cm.get_cmap("gist_rainbow", self.net_x.number_of_nodes())
+        # curve color in the ingress traffic plot
+        self.ingress_node_colors = {f"pop{i}": cm(i) for i in range(self.net_x.number_of_nodes())}
+        self.last_point = {f"pop{i}": [0, 0] for i in range(self.net_x.number_of_nodes())}
+
+        # object variables for plot object, set in function create_animation and other
+        self.fig = None
+        # self.ax = plt.subplots(2, 1)
+        self.ax, self.ing_traffic_ax, self.dropped_flows_ax = None, None, None
+        self.ln = None  # contains static parts of the plot
+        self.online_ln = []
+        # self.time_label = plt.text(self.axis_extent[0, 0] + 1, self.axis_extent[1, 0] + 1, "0")
+        # self.ln.append(self.time_label)
+        self.artists = []  # list of artists to pass to the ArtistAnimation object
+        self.animation = None  # animation object
+
+        self.moments = []  # for the slider attempt
+
+    def set_total_flows(self):
+        """
+        Sets the column 'total flows' to successful_flows + dropped_flows.
+        :return: None
+        """
+        total_flows = []
+        for i, row in self.run_flows.iterrows():
+            total_flows.append(row["successful_flows"] + row["dropped_flows"])
+        self.run_flows["total_flows"] = total_flows
+
+    def get_ingress_and_resources_files(self):
+        """
+        Reads node_metrics.csv or resources.csv and rl_state.csv resolving the different cases.
+        :return: None
+        """
+        if os.path.split(self.node_metrics_file)[1] in os.listdir(self.test_dir):
+            self.node_metrics = pd.read_csv(self.node_metrics_file)
+        else:
+            if os.path.split(self.resources_file)[1] in os.listdir(self.test_dir):
+                self._resources = pd.read_csv(self.resources_file).groupby(["time"])
+            if os.path.split(self.rl_state_file)[1] in os.listdir(self.test_dir):
+                self.rl_state = pd.read_csv(self.rl_state_file, header=None)
+                self.rl_state.columns = ["episode", "time"] + [f"pop{i}" for i in range(self.net_x.number_of_nodes())]
+            else:
+                self.additional_subplots.remove("ingress_traffic")
+
+    def get_ingress_traffic(self, node, frame):
+        """
+        Reads ingress_traffic either from node_metrics DataFrame or the rl_state DataFrame.
+        :param node: str
+        :param frame: int
+        :return: float
+        """
+        if self.node_metrics is not None:
+            ret = self.node_metrics["ingress_traffic"][self.node_metrics["time"] == frame]
+            return ret[self.node_metrics["node"] == node].iloc[0]
+        elif self.rl_state is not None:
+            return self.rl_state[node][self.rl_state["time"] == frame].iloc[0]
+        else:
+            return None
+
+    @property
+    def resources(self):
+        """
+        Returns Groupby object either of node_metrics or resources
+        :return:
+        """
+        if self.node_metrics is not None:
+            return self.node_metrics.groupby(["time"])
+        else:
+            return self._resources
 
     def get_network_filename(self):
         listdir = os.listdir(self.test_dir)
         return os.path.join(self.test_dir, list(filter(lambda f: ".graphml" in f, listdir))[0])
 
     def draw_network(self):
-        ln = plt.plot([], [])
-        ln.append(networkx.draw_networkx_nodes(self.net_x, pos=self.node_pos, ax=self.ax))  # , ax=self.ax)
-        ln.append(networkx.draw_networkx_edges(self.net_x, pos=self.node_pos, ax=self.ax))
-        #ln.append(networkx.draw_networkx_labels(self.net_x, pos=self.node_pos))
-        #networkx.draw_networkx_labels(self.net_x, self.apply_label_offset(self.node_pos, 1), labels=dict(zip(list(self.node_pos.keys()), ["test"]*11)))
+        """
+        Draws network edges.
+        :return:
+        """
+        ln = [networkx.draw_networkx_edges(self.net_x, pos=self.node_pos, ax=self.ax)]
         return ln
 
     def apply_label_offset(self, data, offset):
-        return {key: np.array([value[0]+offset, value[1]+offset]) for key, value in data.items()}
+        """
+        Currently not used. Was for using the networkx plot funtions with offsets.
+        :param data: dict of the form {key1: [x1, y1], key2: [x2, y2], ...}
+        :param offset: int
+        :return: dict of the form {key1: [x1 + offset, y1 + offset], key2: [x2 + offset, y2 + offset], ...}
+        """
+        return {key: np.array([value[0] + offset, value[1] + offset]) for key, value in data.items()}
 
     def determine_node_pos(self):
-        if (all(map(lambda x: x[1].get("Latitude", None), self.net_x.nodes(data=True))) and
-                all(map(lambda x: x[1].get("Longitude", None), self.net_x.nodes(data=True)))):
+        # if all nodes have those properties
+        if (all(
+                map(lambda x: x[1].get("Latitude", None), self.net_x.nodes(data=True))
+        ) and all(
+            map(lambda x: x[1].get("Longitude", None), self.net_x.nodes(data=True))
+        )):
             return {node: np.array([data.get("Longitude", None), data.get("Latitude", None)])
-                    for node, data in list(self.net_x.nodes(data=True))}
+                    for node, data in list(self.net_x.nodes(data=True))}  # format for networkx plot functions
         else:
-            return None
+            return networkx.spring_layout(self.net_x)
 
     def determine_edge_pos(self):
+        # same format as for the nodes, but not used anymore
         edge_pos = {}
         for source, target, data in self.net_x.edges(data=True):
-            edge_pos[(source, target)] = (self.node_pos[source] + self.node_pos[target])/2
+            edge_pos[(source, target)] = (self.node_pos[source] + self.node_pos[target]) / 2
         return edge_pos
 
     def determine_extent(self):
+        # used for xlim and ylim plot properties: outmost node position + extent_offset
         coordinates = np.array(list(self.node_pos.values()))
-        return np.array([[np.min(coordinates[:, 0]) - self.extent_offset, np.max(coordinates[:, 0]) + self.extent_offset],
-                         [np.min(coordinates[:, 1]) - self.extent_offset, np.max(coordinates[:, 1]) + self.extent_offset]])
+        return np.array(
+            [[np.min(coordinates[:, 0]) - self.extent_offset, np.max(coordinates[:, 0]) + self.extent_offset],
+             [np.min(coordinates[:, 1]) - self.extent_offset, np.max(coordinates[:, 1]) + self.extent_offset]]
+        )
 
     def set_linkDelay(self):
         SPEED_OF_LIGHT = 299792458  # meter per second
@@ -114,21 +232,66 @@ class PlacementAnime:
             e[2]["LinkDelay"] = delay
 
     def plot_components(self, frame):
+        """
+        Plots component letters for a point in time (frame) using plt.text
+        :param frame: int
+        :return: axis
+        """
         ln = []
         for node, data in self.placement.get_group(frame).groupby(["node"]):
             x, y = self.node_pos[node.replace("pop", "")]
             for component in data["sf"]:
-                ln.append(self.ax.text(x+self.component_offsets[component], y-self.component_offsets_y, component,
-                                    color=self.component_colors[component], label=component))
+                ln.append(self.ax.text(x + self.component_offsets[component], y - self.component_offsets_y, component,
+                                       color=self.component_colors[component], label=component))
         return ln
 
     def plot_capacity(self):
+        """
+        plots capacity in the right upper coner from the node (offset +1)
+        :return: axis
+        """
         ln = []
         for node, pos in self.node_pos.items():
-            ln.append(self.ax.text(*(pos+1), s=self.net_x.nodes(data=True)[node].get("NodeCap", None), fontdict={"color": "b"}))
+            ln.append(self.ax.text(*(pos + 1), s=self.net_x.nodes(data=True)[node].get("NodeCap", None),
+                                   fontdict={"color": "b"}))
+        return ln
+
+    def plot_node_load(self, frame):
+        """
+        Plots node_load in the format <used_resources>/<node_capacity>
+        :param frame:
+        :return: axis
+        """
+        ln = []
+        node_colors = [(0.0, 0.0, 0.0, 1.0)] * self.net_x.number_of_nodes()
+        for node, data in self.resources.get_group(frame).groupby(["node"]):
+            x, y = self.node_pos[node.replace("pop", "")] + 1
+            capacity = data['node_capacity'].iloc[0]
+            if capacity != 0:
+                node_load = data['used_resources'].iloc[0] / capacity
+                node_color = self.node_load_cmap(node_load)
+                complement_node_color = complement(*node_color)
+            else:
+                node_load = 0
+                node_color = (0.0, 0.0, 0.0, 1.0)
+                complement_node_color = (1.0, 1.0, 1.0, 1.0)
+            node_colors[int(node.replace("pop", ""))] = node_color
+            ln.append(self.ax.text(x, y, f"{data['used_resources'].iloc[0]}/{data['node_capacity'].iloc[0]}",
+                                   color=node_color))
+            # print("Color: ", node_color)
+            # print("complement: ", 1.0 - np.array(node_color))
+            self.id_labels[node.replace("pop", "")].set_color(complement_node_color)
+            if self.net_x.nodes[node.replace("pop", "")]["NodeType"] == "Ingress":
+                self.id_labels[node.replace("pop", "")].set_bbox(
+                    dict(boxstyle="circle", fill=False, color=complement_node_color))
+        ln.append(networkx.draw_networkx_nodes(self.net_x, pos=self.node_pos, ax=self.ax, node_color=node_colors))
         return ln
 
     def plot_delay(self):
+        """
+        plots delay on the edges
+        :return: axis
+        """
         ln = []
         for edge, pos in self.edge_pos.items():
             for e in self.net_x.edges(data=True):
@@ -136,71 +299,245 @@ class PlacementAnime:
                     ln.append(self.ax.text(*pos, s=e[2].get("LinkDelay", None), fontdict={"color": "r"}))
         return ln
 
+    def plot_node_ids(self):
+        """
+        Plots the node ID labes on the nodes.
+        :return:
+        """
+        ln = []
+        for node, pos in self.node_pos.items():
+            if self.net_x.nodes[node]["NodeType"] == "Ingress":
+                self.id_labels[node] = self.ax.text(*(pos - 0.1), s=str(node), color="white",
+                                                    bbox=dict(boxstyle="circle", fill=False, color="white"))
+            else:
+                self.id_labels[node] = self.ax.text(*(pos - 0.1), s=str(node), color="white")
+            ln.append(self.id_labels[node])
+        return ln
+
+    def previous_frame(self, frame):
+        return frame - self.run_duration * self.sample_rate
+
     def plot_ingress_traffic(self, frame):
-        ln = plt.plot([], [])
+        """
+        plots a line from the previous point self.last_point[node]==[frame-1, value] to the current point (frame, value)
+        :param frame: int
+        :return: axis
+        """
+        ln = []
         for node in self.net_x.nodes:
-            x = np.array([self.last_point[f"pop{node}"][0], frame])
-            y = np.array([self.last_point[f"pop{node}"][1], self.ingress_traffic[f"pop{node}"][self.ingress_traffic["time"] == frame].iloc[0]])
-            #print(frame, y)
-            ln.extend(self.ing_traffic_ax.plot(x, y, color=self.ingress_node_colors[f"pop{node}"]))
+            x = np.array([self.previous_frame(frame), frame])
+            y = np.array([self.get_ingress_traffic(f"pop{node}", self.previous_frame(frame)),
+                          self.get_ingress_traffic(f"pop{node}", frame)])
+
+            # ln.extend(self.ing_traffic_ax.plot(x, y, "o", color=self.ingress_node_colors[f"pop{node}"]))
+
             self.last_point[f"pop{node}"][0] = x[1]
             self.last_point[f"pop{node}"][1] = y[1]
-            #ln.extend(self.ing_traffic_ax.plot([frame], [y], color=self.ingress_node_colors[node]))
+            ln_element = self.ing_traffic_ax.plot(frame, y[1], marker=".", color=self.ingress_node_colors[f"pop{node}"])
+            ln.extend(ln_element)
+        return ln
+
+    def plot_dropped_flows(self, frame):
+        """
+        Plots successful, dropped and total number of flows over time.
+        :param frame: int
+        :return:
+        """
+        ln = []
+        for col in ["successful_flows", "dropped_flows"]:
+            total_flows = self.run_flows[self.run_flows["time"] == frame]["total_flows"].iloc[0]
+            if total_flows == 0:
+                total_flows = 1
+            x = np.array([self.previous_frame(frame), frame])
+            y = np.array(
+                [self.run_flows[self.run_flows["time"] == self.previous_frame(frame)][col].iloc[0] / total_flows,
+                 self.run_flows[self.run_flows["time"] == frame][col].iloc[0] / total_flows]
+            )
+
+            # ln.extend(self.dropped_flows_ax.plot(x, y, "o", color=self.run_flows_colors[col]))
+            ln_element = self.dropped_flows_ax.plot(x[1], y[1], ".", color=self.run_flows_colors[col])
+            ln.extend(ln_element)
+
+            self.dropped_flows_last_point[col][0] = x[1]
+            self.dropped_flows_last_point[col][1] = y[1]
         return ln
 
     def init(self):
+        """
+        Sets xlim and ylim for both axis objects
+        :return:
+        """
         self.ax.set_xlim(self.axis_extent[0, :])  # set limits
         self.ax.set_ylim(self.axis_extent[1, :])
-        self.ing_traffic_ax.set_xlim([self.ingress_traffic["time"][0], self.ingress_traffic["time"][self.ingress_traffic["time"].size - 1]])
-        #self.ing_traffic_ax.set_xlim([0, 15000])
-        self.ing_traffic_ax.set_ylim([0, 0.5])
         return self.ln
 
+    def init_ing_traffic_ax(self):
+        # xlim = [first point in time, last point in time]
+        if self.node_metrics is not None:
+            x_max = self.node_metrics["time"][self.node_metrics["time"].size - 1]
+            self.ing_traffic_ax.set_xlim([self.node_metrics["time"][0], x_max])
+            ing_max = np.max(np.max(self.node_metrics["ingress_traffic"]))
+            self.ing_traffic_ax.set_ylim([ing_max * 0.1, ing_max * 1.2])
+        else:
+            x_max = self.rl_state["time"][self.rl_state["time"].size - 1]
+            self.ing_traffic_ax.set_xlim([self.rl_state["time"][0], x_max])
+            columns = [col for col in self.rl_state.columns if "pop" in col]
+            ing_max = np.max(np.max(self.rl_state[columns]))
+            self.ing_traffic_ax.set_ylim([ing_max * 0.1, ing_max * 1.2])
+        for i, items in enumerate(self.ingress_node_colors.items()):
+            self.ing_traffic_ax.text(
+                x_max + x_max * 0.03 * ((i + 1) // 7), ing_max - ing_max * 0.3 * (i % 7), s=items[0],
+                color=items[1], size="smaller")
+
+    def init_dropped_flows_ax(self):
+        # xlim = [first point in time, last point in time]
+        x_max = self.run_flows["time"][self.run_flows["time"].size - 1]
+        self.dropped_flows_ax.set_xlim([self.run_flows["time"][0], x_max])
+        self.dropped_flows_ax.set_ylim([-0.1, 1.2])
+        for i, col in enumerate(["successful_flows", "dropped_flows"]):
+            self.dropped_flows_ax.text(x_max - x_max * 0.1, 1.01 - 1.1 * 0.3 * (i + 1),
+                                       s=col, color=self.run_flows_colors[col])
+
     def plot_moment(self, frame):
-        ln2 = plt.plot([], [])
+        # for the slider attempt
+        ln2 = []
         # self.time_label._text = str(frame)
         # print("changed: ", self.time_label)
         ln2.extend(self.plot_components(frame))
         ln2.append(self.ax.text(self.axis_extent[0, 0] + 1, self.axis_extent[1, 0] + 1, str(frame)))
-        #self.ln_ingress.extend(self.plot_ingress_traffic(frame))
-        #ln2.extend(self.ln_ingress)
+        # self.ln_ingress.extend(self.plot_ingress_traffic(frame))
+        # ln2.extend(self.ln_ingress)
         return ln2
 
     def create_moments(self):
+        # for the slider attempt
         ln = []
         self.init()
         for frame in self.placement.groups:
             ln.append(self.plot_moment(frame))
         self.moments.extend(ln)
 
-    def update(self, frame):
-        lns = plt.plot([], [])
-        ln2 = plt.plot([], [])
-        #self.time_label._text = str(frame)
-        #print("changed: ", self.time_label)
+    def update(self, frame, thread=False, index=None):
+        """
+        Creates plots for one single frame==point in time
+        :param frame: int
+        :return: axis
+        """
+        lns = []
+        ln2 = []
+        # self.time_label._text = str(frame)
+        # print("changed: ", self.time_label)
         ln2.extend(self.plot_components(frame))
+        if frame == 0 or self.previous_frame(frame) <= 0:
+            pass
+        else:
+            ln2.extend(self.plot_node_load(frame))
+            if "ingress_traffic" in self.additional_subplots:
+                self.ln.extend(self.plot_ingress_traffic(frame))
+            if "dropped_flows" in self.additional_subplots:
+                self.ln.extend(self.plot_dropped_flows(frame))
+
+        # plot the point in time as text: 1 point from the left lower corner
         ln2.append(self.ax.text(self.axis_extent[0, 0] + 1, self.axis_extent[1, 0] + 1, str(frame)))
-        self.ln.extend(self.plot_ingress_traffic(frame))
+
         lns.extend(self.ln)
         lns.extend(ln2)
-        return lns
+        if thread:
+            self.online_ln[index].extend(lns)
+        else:
+            return lns
 
     def create_artists(self):
+        """
+        Creates artists
+        :return: axis
+        """
+        groups = list(self.placement.groups)
+        groups.sort()
+        groups = groups[::self.sample_rate]
         ln = []
-        self.init()
-        for frame in self.placement.groups:
+        for frame in groups[::self.sample_rate]:
             ln.append(self.update(frame))
         return ln
 
+    def init_subplots(self):
+        self.fig = plt.figure()
+        gs = self.fig.add_gridspec(10, 1)
+        self.ax = self.fig.add_subplot(gs[:-len(self.additional_subplots) * self.place_per_axis, 0])
+        self.init()
+
+        add_ax_position = len(self.additional_subplots) * self.place_per_axis
+        if "ingress_traffic" in self.additional_subplots:
+            self.ing_traffic_ax = self.fig.add_subplot(gs[-add_ax_position:-(add_ax_position - self.place_per_axis), 0])
+            self.init_ing_traffic_ax()
+            add_ax_position -= self.place_per_axis
+        if "dropped_flows" in self.additional_subplots:
+            self.dropped_flows_ax = self.fig.add_subplot(gs[-add_ax_position:, 0])
+            self.init_dropped_flows_ax()
+
     def create_animation(self):
+        """
+        Upper function. Calls other functions and creates the animation object
+        :return: None
+        """
+        self.init_subplots()
+
+        self.ln = []
+        self.ln.extend(self.draw_network())
+        self.ln.extend(self.plot_node_ids())
+        self.ln.extend(self.plot_delay())
+
         self.artists = [self.ln]
         self.artists.extend(self.create_artists())
-        self.animation = ArtistAnimation(self.fig, self.artists, interval=100, repeat=False)
+        self.animation = ArtistAnimation(self.fig, self.artists, interval=self.interval, repeat=False)
+
+    def save_animation(self, mode, VIDEO_DIR="."):
+        """
+        Create and save matplotlib animation
+        :param mode: How to save the animation. Options: 'video' (=html5) or 'gif' (requires ImageMagick)
+        """
+
+        # save html5 video
+        if mode == 'html' or mode == 'both':
+            html = self.animation.to_html5_video()
+            with open(f'{VIDEO_DIR}/{self.video_filename}.html', 'w') as f:
+                f.write(html)
+            # self.log.info('Video saved', path=f'{VIDEO_DIR}/{self.result_filename}.html')
+
+        # save gif; requires external dependency ImageMagick
+        if mode == 'gif' or mode == 'both':
+            try:
+                self.animation.save(f'{VIDEO_DIR}/{self.video_filename}.gif', writer='imagemagick')
+                # self.log.info('Gif saved', path=f'{VIDEO_DIR}/{self.result_filename}.gif')
+            except TypeError as e:
+                # self.log.error('ImageMagick needs to be installed for saving gifs.')
+                print(type(e), e)
+
+
+class PlacementFuncAnime(PlacementAnime):
+
+    def __init__(self, *args, **kwargs):
+        super(PlacementFuncAnime, self).__init__(*args, **kwargs)
+
+        self.component_labels = {node: {sf: [pos[0] + offset, pos[1] + self.component_offsets_y]
+                                        for sf, offset in self.component_offsets.items()}
+                                 for node, pos in self.node_pos.items()}
+
+    def create_animation(self):
+        self.init_subplots()
+
+    def allocate_labels(self):
+        for node, d in self.component_labels.items():
+            for sf in d:
+                d[sf] = self.ax.text(*(d[sf]), s=sf, color=self.component_colors[sf], label="sf")
 
 
 class PlacementAnimesManager:
-
+    """
+    For the dropdown menu attempt
+    """
     def __init__(self, results_dir):
+        """finds all the test directories"""
         self.cur_anime = None
         self.animes = []
         for root, subdirs, files in os.walk(results_dir):
@@ -208,6 +545,11 @@ class PlacementAnimesManager:
                 self.animes.append(root)
 
     def load_animation(self, root):
+        """
+        Creates the animation
+        :param root: test directory
+        :return:
+        """
         self.cur_anime = PlacementAnime(root)
         self.cur_anime.create_animation()
         return self.cur_anime
@@ -217,15 +559,23 @@ def parse_args(args=None):
     parser = ArgumentParser()
     parser.add_argument("--results_dir", default=None)
     parser.add_argument("--test_dir", default=None)
-    #parser.add_argument("-a", "--timestamp_seed_agent", default=None, dest="timestamp_seed_agent")
-    #parser.add_argument("-t", "--timestamp_seed_test", default=None, dest="timestamp_seed_test")
+    # parser.add_argument("-a", "--timestamp_seed_agent", default=None, dest="timestamp_seed_agent")
+    # parser.add_argument("-t", "--timestamp_seed_test", default=None, dest="timestamp_seed_test")
     parser.add_argument("-st", "--show_tests", default=False, action="store_true", dest="show_tests")
-    parser.add_argument("--show", default=False, action="store_true")
-    parser.add_argument("--save", default=False, action="store_true")
+    parser.add_argument("--show", default=False, action="store_true",)
+    parser.add_argument("--save", default=None, choices=["html", "gif", "both"])
+    parser.add_argument("--sample_rate", default=1, type=int)
+    parser.add_argument("--interval", default=100, type=int)
+    parser.add_argument("--anime_filename", default=None)
     return vars(parser.parse_args(args))
 
 
 def list_tests(results_dir):
+    """
+    Finds all the test directories of a results directory
+    :param results_dir: str
+    :return: list of directory strings (relative to current execution point)
+    """
     animes = []
     for root, subdirs, files in os.walk(results_dir):
         if len(files) != 0 and "test" in root:
@@ -233,34 +583,51 @@ def list_tests(results_dir):
     return animes
 
 
+def load_config(filename):
+    if filename:
+        with open(filename, "r") as f:
+            config = yaml.load(f)
+    else:
+        config = {}
+    return config
+
+
 def main(args=None):
-    args = parse_args(args)
+    """
+    Main function
+    :param args:
+    :return:
+    """
+    kwargs = parse_args(args)
     tests = None
-    if args["results_dir"]:
-        tests = list_tests(args["results_dir"])
-    print(args)
-    if args["show_tests"]:
+    if kwargs["results_dir"]:
+        tests = list_tests(kwargs["results_dir"])
+    print(kwargs)
+    if kwargs["show_tests"]:
         pprint(tests)
     else:
-        if not args["test_dir"]:
-            args["test_dir"] = tests[0]
-        pa = PlacementAnime(args["test_dir"])
+        if not kwargs["test_dir"]:
+            kwargs["test_dir"] = tests[0]
+        print("Creating PlacementAnime object...")
+        pa = PlacementAnime(kwargs["test_dir"], sample_rate=kwargs["sample_rate"], interval=kwargs["interval"],
+                            video_filename=kwargs["anime_filename"])
+        print("Creating animation...")
         pa.create_animation()
-        if args["show"]:
+        if kwargs["show"]:
+            print("Showing...")
             plt.show()
-        if args["save"]:
-            print(f'{pa.video_filename}.html')
-            html = pa.animation.to_html5_video()
-            with open(f'{pa.video_filename}.html', 'w') as f:
-                f.write(html)
-
-    # plt.show()
-    #list(pam.animes.values())[0].fig.show()
+        if kwargs["save"]:
+            print("Saving animation...")
+            pa.save_animation(kwargs["save"])
+            if kwargs["save"] == "both":
+                print(f'{pa.video_filename}.html', " and ", f'{pa.video_filename}.gif')
+            else:
+                print(f'{pa.video_filename}.{kwargs["save"]}')
 
 
 if __name__ == "__main__":
-    #main(["--test_dir", ".", "--show"])
-    main()
+    main(["--results_dir", "line-results-w-prediction", "--show", "--sample_rate", "2"])
+    # main()
     """pa = PlacementAnime()
     artists = [pa.ln]
     artists.extend(pa.create_artists())
