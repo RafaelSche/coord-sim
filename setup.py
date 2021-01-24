@@ -4,8 +4,9 @@ requirements = [
     'networkx==2.4',
     'geopy',
     'pyyaml>=5.1',
-    'numpy==1.16.4',
+    'numpy>=1.16.5',
     'common-utils',
+    'cython',   # otherwise sklearn fails
     'sklearn',
     'pandas',
     'tensorflow==1.14.0',
@@ -24,7 +25,7 @@ dependency_links = [
 
 setup(
     name='coord-sim',
-    version='1.0.0',
+    version='2.1.0',
     description='Simulate flow-level, inter-node network coordination including scaling and placement of services and '
                 'scheduling/balancing traffic between them.',
     url='https://github.com/RealVNF/coord-sim',
